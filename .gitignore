@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+
+# PyInstaller
+*.spec
+*.manifest
+
+# IDE
+.vscode/
+.idea/
+
+# WorkBuddy
+.workbuddy/
+
+# OS
+Thumbs.db
+Desktop.ini
