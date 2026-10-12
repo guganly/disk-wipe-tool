@@ -5,7 +5,7 @@ echo.
 echo Installing dependencies: psutil + pywin32
 echo.
 
-set "PYTHON_EXE=C:\Users\yanwh\.workbuddy\binaries\python\versions\3.13.12\python.exe"
+set "PYTHON_EXE=C:\Users\yanwh\AppData\Local\Python\pythoncore-3.14-64\python.exe"
 set "VENV_DIR=C:\Users\yanwh\.workbuddy\binaries\python\envs\disk_wipe"
 
 if not exist "%VENV_DIR%" (
