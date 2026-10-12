@@ -76,40 +76,77 @@ def run_as_admin():
 #  磁盘信息工具
 # ──────────────────────────────────────────────────────────
 
+def _ps_lines(script, timeout=20):
+    """
+    执行 PowerShell 脚本，按行返回 stdout（已去掉空行）。
+    Windows 11 24H2 已移除 wmic，所有 WMI 查询统一走 PowerShell CIM。
+    """
+    result = _run(
+        ["powershell", "-NoProfile", "-NonInteractive",
+         "-ExecutionPolicy", "Bypass", "-Command", script],
+        timeout=timeout
+    )
+    if result.returncode != 0:
+        return []
+    return [l.strip() for l in result.stdout.splitlines() if l.strip()]
+
+
+def _ps_csv(script, timeout=20):
+    """执行 PowerShell 脚本（输出 CSV），解析为字典列表"""
+    import csv
+    import io
+    result = _run(
+        ["powershell", "-NoProfile", "-NonInteractive",
+         "-ExecutionPolicy", "Bypass", "-Command", script],
+        timeout=timeout
+    )
+    if result.returncode != 0:
+        return []
+    text = result.stdout.strip()
+    if not text:
+        return []
+    # 去掉 UTF-8 BOM，csv 模块解析带引号字段
+    text = text.lstrip("\ufeff")
+    rows = list(csv.reader(io.StringIO(text)))
+    if len(rows) < 2:
+        return []
+    header = [h.strip() for h in rows[0]]
+    out = []
+    for row in rows[1:]:
+        if len(row) < len(header):
+            continue
+        out.append({h: (v or "").strip() for h, v in zip(header, row)})
+    return out
+
+
 def get_all_physical_disks():
     """获取所有物理磁盘信息，返回列表"""
     disks = []
     try:
-        result = _run(
-            ["wmic", "diskdrive", "get",
-             "DeviceID,Model,Size,InterfaceType,MediaType,SerialNumber",
-             "/format:csv"],
+        records = _ps_csv(
+            "Get-CimInstance Win32_DiskDrive | "
+            "Select-Object DeviceID,Model,Size,InterfaceType,MediaType,SerialNumber | "
+            "ConvertTo-Csv -NoTypeInformation",
             timeout=15
         )
-        lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
-        if len(lines) < 2:
-            return disks
-        header = [h.strip() for h in lines[0].split(",")]
-        for line in lines[1:]:
-            parts = line.split(",")
-            if len(parts) < len(header):
-                continue
-            record = dict(zip(header, parts))
-            device_id = record.get("DeviceID", "").strip()
+        for record in records:
+            device_id = record.get("DeviceID", "")
             if not device_id:
                 continue
-            size_bytes = int(record.get("Size", "0") or 0)
-            size_gb = size_bytes / (1024 ** 3)
+            try:
+                size_bytes = int(record.get("Size", "0") or 0)
+            except ValueError:
+                size_bytes = 0
             disks.append({
                 "device_id": device_id,
-                "model": record.get("Model", "Unknown").strip(),
-                "interface": record.get("InterfaceType", "Unknown").strip(),
-                "media_type": record.get("MediaType", "Unknown").strip(),
-                "serial": record.get("SerialNumber", "N/A").strip(),
-                "size_gb": size_gb,
+                "model": record.get("Model", "Unknown") or "Unknown",
+                "interface": record.get("InterfaceType", "Unknown") or "Unknown",
+                "media_type": record.get("MediaType", "Unknown") or "Unknown",
+                "serial": record.get("SerialNumber", "N/A") or "N/A",
+                "size_gb": size_bytes / (1024 ** 3),
                 "size_bytes": size_bytes,
             })
-    except Exception as e:
+    except Exception:
         pass
     return disks
 
@@ -128,70 +165,35 @@ def get_system_disk_index():
     检测系统盘（Windows 安装所在物理磁盘编号）。
     返回 PhysicalDrive 编号（如 0）；检测失败返回 None。
     """
-    import re
     try:
-        # 1. 获取系统盘符，如 C:
-        r = _run(
-            ["wmic", "os", "get", "SystemDrive", "/format:csv"],
-            timeout=10
+        # Get-Partition 的 IsBoot 标记启动分区，一步拿到磁盘编号
+        lines = _ps_lines(
+            "(Get-Partition | Where-Object { $_.IsBoot } | "
+            "Select-Object -First 1).DiskNumber",
+            timeout=15
         )
-        m = re.search(r"([A-Z]):", r.stdout)
-        if not m:
-            return None
-        sys_drive = m.group(1) + ":"
-
-        # 2. 通过逻辑磁盘→分区→物理磁盘反查 DiskIndex
-        #    用 wmic path Win32_DiskDriveToDiskPartition 一步到位
-        r2 = _run(
-            ["wmic", "path", "Win32_DiskDriveToDiskPartition", "get",
-             "Antecedent,Dependent", "/format:csv"],
-            timeout=10
+        if lines:
+            return int(lines[0])
+    except Exception:
+        pass
+    try:
+        # 备用方案：Win32_LogicalDiskToPartition 反查
+        # Antecedent = Win32_LogicalDisk.DeviceID="C:"
+        # Dependent  = Win32_DiskPartition.DeviceID="Disk #0, Partition #1"
+        import re
+        records = _ps_csv(
+            "Get-CimInstance Win32_LogicalDiskToPartition | "
+            "Select-Object Antecedent,Dependent | "
+            "ConvertTo-Csv -NoTypeInformation",
+            timeout=15
         )
-        # Antecedent = \\COMPUTER\root\cimv2:Win32_DiskDrive.DeviceID="\\\\.\\PHYSICALDRIVE0"
-        # Dependent   = \\COMPUTER\root\cimv2:Win32_DiskPartition.DeviceID="Disk #0, Partition #1"
-        partition_to_disk = {}
-        for line in r2.stdout.splitlines():
-            a_match = re.search(r'PhysicalDrive(\d+)', line, re.IGNORECASE)
-            d_match = re.search(r'Disk #(\d+)', line)
-            if a_match and d_match:
-                partition_to_disk[int(d_match.group(1))] = int(a_match.group(1))
-
-        # 3. 获取系统盘符对应的分区 DiskIndex
-        r3 = _run(
-            ["wmic", "partition", "get", "DeviceID,BootPartition",
-             "/format:csv"],
-            timeout=10
-        )
-        for line in r3.stdout.splitlines():
-            if "TRUE" in line.upper():
-                m2 = re.search(r'Disk #(\d+)', line)
-                if m2:
-                    part_disk_idx = int(m2.group(1))
-                    disk_idx = partition_to_disk.get(part_disk_idx)
-                    if disk_idx is not None:
-                        return disk_idx
-
-        # 备用方案：枚举所有分区的盘符对应
-        r4 = _run(
-            ["wmic", "logicaldisk", "where", f"DeviceID='{sys_drive}'",
-             "get", "DeviceID", "/format:csv"],
-            timeout=10
-        )
-        if sys_drive in r4.stdout:
-            # 映射系统盘符到分区再查物理磁盘
-            r5 = _run(
-                ["wmic", "path", "Win32_LogicalDiskToPartition", "get",
-                 "Antecedent,Dependent", "/format:csv"],
-                timeout=10
-            )
-            for line in r5.stdout.splitlines():
-                if sys_drive in line:
-                    m3 = re.search(r'Disk #(\d+)', line)
-                    if m3:
-                        disk_idx = partition_to_disk.get(int(m3.group(1)))
-                        if disk_idx is not None:
-                            return disk_idx
-
+        for record in records:
+            ant = record.get("Antecedent", "")
+            dep = record.get("Dependent", "")
+            m_drive = re.search(r'Win32_LogicalDisk\.DeviceID="?([A-Z]):', ant)
+            m_disk = re.search(r'Disk #(\d+)', dep)
+            if m_drive and m_disk and m_drive.group(1) == "C":
+                return int(m_disk.group(1))
     except Exception:
         pass
     return None
@@ -200,30 +202,17 @@ def get_volumes_for_disk(disk_index):
     """获取磁盘对应的所有盘符"""
     volumes = []
     try:
-        result = _run(
-            ["wmic", "partition", "where",
-             f"DiskIndex={disk_index}",
-             "get", "DeviceID", "/format:csv"],
-            timeout=10
+        lines = _ps_lines(
+            f"Get-Partition -DiskNumber {disk_index} | "
+            "Where-Object DriveLetter | "
+            "ForEach-Object { \"$($_.DriveLetter):\" }",
+            timeout=15
         )
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if "Disk #" in line:
-                partition_id = line.split(",")[-1].strip()
-                # 获取逻辑磁盘
-                res2 = _run(
-                    ["wmic", "path", "Win32_LogicalDiskToPartition",
-                     "where", f"Antecedent like '%{partition_id.replace(chr(32), '_')}%'",
-                     "get", "Dependent", "/format:csv"],
-                    timeout=10
-                )
-                for l in res2.stdout.splitlines():
-                    l = l.strip()
-                    if "Win32_LogicalDisk" in l:
-                        import re
-                        m = re.search(r'DeviceID="([A-Z]:)"', l)
-                        if m:
-                            volumes.append(m.group(1))
+        for line in lines:
+            import re
+            m = re.fullmatch(r"([A-Z]):", line)
+            if m:
+                volumes.append(m.group(0))
     except Exception:
         pass
     return volumes
